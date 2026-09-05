@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fake systemctl for tests
+case "${1:-}" in
+    cat) exit 0 ;;
+    reload)
+        echo "reload $2" >> "${FAKE_LOG:-/dev/null}"
+        [[ -n "${FAKE_RELOAD_FAIL:-}" ]] && exit 1
+        exit 0 ;;
+esac
+exit 0
+

@@ -198,4 +198,3 @@ server-hardening-script/
 ## License
 
 MIT
-

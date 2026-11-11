@@ -196,4 +196,3 @@ fi
 echo
 echo "Result: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]
-

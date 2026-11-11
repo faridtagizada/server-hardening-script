@@ -11,6 +11,10 @@ trap 'rm -rf "$WORK"' EXIT
 PASS=0
 FAIL=0
 
+for f in "$HARDEN" "$FAKEBIN/sshd" "$FAKEBIN/systemctl"; do
+    [[ -x "$f" ]] || { echo "FAIL - $f is not executable (run: chmod +x harden.sh tests/fakebin/*)"; exit 1; }
+done
+
 ok()   { PASS=$((PASS + 1)); echo "ok   - $1"; }
 fail() {
     FAIL=$((FAIL + 1)); echo "FAIL - $1"
@@ -20,9 +24,12 @@ t() {  # t NAME COMMAND... : passes if the command returns 0
     local name="$1"; shift
     if "$@" >/dev/null 2>&1; then ok "$name"; else fail "$name"; fi
 }
-tn() { # tn NAME COMMAND... : passes if the command returns non-zero
-    local name="$1"; shift
-    if "$@" >/dev/null 2>&1; then fail "$name (succeeded, should have failed)"; else ok "$name"; fi
+tn() { # tn NAME COMMAND... : passes if the command refuses (126/127 mean it could not even start)
+    local name="$1" rc; shift
+    "$@" >/dev/null 2>&1; rc=$?
+    if (( rc == 0 )); then fail "$name (succeeded, should have failed)"
+    elif (( rc == 126 || rc == 127 )); then fail "$name (could not run, rc=$rc)"
+    else ok "$name"; fi
 }
 has()  { grep -qF -- "$2" <<<"$1"; }
 mode() { stat -c %a "$1"; }
@@ -56,6 +63,7 @@ t  "valid_ssh_key: valid ed25519" valid_ssh_key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE
 tn "valid_ssh_key: type only" valid_ssh_key "ssh-ed25519"
 tn "valid_ssh_key: random text" valid_ssh_key "rm -rf /"
 tn "valid_ssh_key: unsupported dss" valid_ssh_key "ssh-dss AAAAB3Nza"
+t  "valid_ssh_key: FIDO ecdsa key" valid_ssh_key "sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhExample user@pc"
 
 out=$(KEEP_PASSWORD_AUTH=0 render_sshd_config)
 for line in "PermitRootLogin no" "PasswordAuthentication no" "PermitEmptyPasswords no" "X11Forwarding no" "MaxAuthTries 3"; do
@@ -75,7 +83,11 @@ if [[ -n "$home" ]]; then
       : > "$ROOT_PREFIX$home/.ssh/authorized_keys"
       tn "has_authorized_keys: empty file" has_authorized_keys "$me"
       echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample" > "$ROOT_PREFIX$home/.ssh/authorized_keys"
-      t  "has_authorized_keys: key present" has_authorized_keys "$me" ) > "$WORK/hk.out"
+      t  "has_authorized_keys: key present" has_authorized_keys "$me"
+      echo 'from="10.0.0.0/8",no-pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample' > "$ROOT_PREFIX$home/.ssh/authorized_keys"
+      t  "has_authorized_keys: key with options" has_authorized_keys "$me"
+      echo '# ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample (disabled)' > "$ROOT_PREFIX$home/.ssh/authorized_keys"
+      tn "has_authorized_keys: commented-out key" has_authorized_keys "$me" ) > "$WORK/hk.out"
     cat "$WORK/hk.out"; PASS=$((PASS + $(grep -c '^ok' "$WORK/hk.out"))); FAIL=$((FAIL + $(grep -c '^FAIL' "$WORK/hk.out")))
 fi
 
@@ -123,6 +135,8 @@ l_ssh=$(grep -n 'ufw limit 22/tcp' <<<"$out" | head -1 | cut -d: -f1)
 l_en=$(grep -n 'ufw --force enable' <<<"$out" | head -1 | cut -d: -f1)
 [[ -n "$l_ssh" && -n "$l_en" && "$l_ssh" -lt "$l_en" ]] && ok "firewall: SSH rule comes before enable" || fail "firewall: wrong order" "$out"
 has "$out" "ufw allow 80/tcp" && ok "firewall: --allow 80/tcp" || fail "firewall: --allow"
+l_deny=$(grep -n 'ufw default deny incoming' <<<"$out" | head -1 | cut -d: -f1)
+[[ -n "$l_ssh" && -n "$l_deny" && "$l_ssh" -lt "$l_deny" ]] && ok "firewall: SSH rule comes before the default deny" || fail "firewall: default deny comes first" "$out"
 out=$(H --steps firewall --ssh-port 2222 2>&1)
 has "$out" "ufw limit 2222/tcp" && ok "firewall: --ssh-port 2222" || fail "firewall: --ssh-port" "$out"
 out=$(SSH_CONNECTION="1.2.3.4 5555 5.6.7.8 2200" H --steps firewall 2>&1)
@@ -148,6 +162,26 @@ if [[ -n "$home" ]]; then
 fi
 
 # --keep-password-auth doesn't need a key (only sudo is checked) -> without sudo it is refused
+r="$WORK/keep"; mkroot "$r"
+out=$(ROOT_PREFIX="$r" H --apply -y --steps ssh --ssh-user "$me" --keep-password-auth 2>&1); rc=$?
+if user_in_sudo "$me"; then
+    [[ $rc -eq 0 ]] && ! grep -q '^PasswordAuthentication' "$r/etc/ssh/sshd_config.d/00-hardening.conf" \
+        && ok "--keep-password-auth: no key needed, password login left alone" || fail "--keep-password-auth" "$out"
+else
+    [[ $rc -ne 0 ]] && has "$out" "not in the sudo group" && ok "--keep-password-auth: still refused without sudo" || fail "--keep-password-auth: sudo check" "$out"
+fi
+
+# --create-user must not count as "has sudo" unless the user step really creates the account in this run
+r="$WORK/nouser"; mkroot "$r"
+out=$(ROOT_PREFIX="$r" H --apply -y --steps ssh --create-user zz-no-such-user --keep-password-auth 2>&1); rc=$?
+[[ $rc -ne 0 && ! -e "$r/etc/ssh/sshd_config.d/00-hardening.conf" ]] && has "$out" "not in the sudo group" \
+    && ok "safeguard: --create-user without the user step is not trusted" || fail "safeguard: --create-user alone closed root login" "$out"
+
+# A file that cannot be written must fail the step instead of reporting success
+r="$WORK/nowrite"; mkroot "$r"; : > "$r/etc/sysctl.d"
+out=$(ROOT_PREFIX="$r" H --apply -y --steps sysctl 2>&1); rc=$?
+[[ $rc -ne 0 ]] && has "$out" "Failed   : sysctl" && ok "write error: the step is reported as failed" || fail "write error was not noticed (rc=$rc)" "$out"
+
 # It must stop on a system with no Include line
 r="$WORK/noinc"; mkroot "$r"; echo "PermitRootLogin yes" > "$r/etc/ssh/sshd_config"
 out=$(ROOT_PREFIX="$r" H --apply -y --steps ssh --ssh-user "$me" --skip-checks 2>&1); rc=$?
@@ -186,6 +220,8 @@ tn "args: bad --ssh-port"        H --ssh-port 99999
 tn "args: bad --create-user"     H --create-user "Bad Name"
 tn "args: unknown option"        H --no-such-option
 tn "args: --steps without value" H --steps
+tn "args: empty --steps"         H --steps ""
+tn "args: --ssh-key without --create-user" H --ssh-key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample"
 t  "args: --help"                H --help
 if [[ $EUID -ne 0 ]]; then
     tn "--apply is refused without root" H --apply -y

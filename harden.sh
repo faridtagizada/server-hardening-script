@@ -12,7 +12,7 @@
 #   * allows the SSH port in ufw FIRST, then enables the firewall
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 ROOT_PREFIX="${ROOT_PREFIX:-}"   # tests only: fake root directory
 DRY_RUN=1
 ASSUME_YES=0
@@ -27,6 +27,8 @@ ALLOW_PORTS=()
 BACKUP_DIR=""
 DONE_STEPS=()
 FAILED_STEPS=()
+USER_STEP_OK=0           # 1 once the user step has finished successfully in this run
+NEEDS_PASSWORD_USER=""   # account created without a password in this run
 ALL_STEPS=(user ssh firewall sysctl passwords perms updates)
 
 # ----------------------------------------------------------------- log
@@ -50,7 +52,7 @@ valid_allow_spec() {
     valid_port "${BASH_REMATCH[1]}"
 }
 valid_ssh_key() {
-    local re='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+([[:space:]].*)?$'
+    local re='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+([[:space:]].*)?$'
     [[ "$1" =~ $re ]]
 }
 
@@ -77,8 +79,8 @@ backup_file() {
     [[ -e "$target" ]] || return 0
     init_backup_dir
     [[ -e "${BACKUP_DIR}${path}" ]] && return 0      # the first (original) copy is kept
-    mkdir -p "$(dirname "${BACKUP_DIR}${path}")"
-    cp -a "$target" "${BACKUP_DIR}${path}"
+    mkdir -p "$(dirname "${BACKUP_DIR}${path}")" || { err "Could not create the backup directory for $path"; return 1; }
+    cp -a "$target" "${BACKUP_DIR}${path}" || { err "Could not back up $path"; return 1; }
 }
 
 restore_file() {
@@ -97,17 +99,18 @@ write_file() {   # write_file PATH MODE CONTENT
         while IFS= read -r line; do echo "         | $line"; done <<<"$content"
         return 0
     fi
-    backup_file "$path"
-    mkdir -p "$(dirname "$target")"
-    printf '%s\n' "$content" > "$target"
-    chmod "$mode" "$target"
+    backup_file "$path" || return 1               # never change a file that could not be backed up
+    mkdir -p "$(dirname "$target")" || { err "Could not create the directory for $path"; return 1; }
+    printf '%s\n' "$content" > "$target" || { err "Could not write $path"; return 1; }
+    chmod "$mode" "$target" || { err "Could not set mode $mode on $path"; return 1; }
     info "Written: $path"
 }
 
 fs_chmod() {
-    local path="$1" mode="$2"
+    local path="$1" mode="$2" old
     if (( DRY_RUN )); then info "[DRY-RUN] chmod $mode $path"; return 0; fi
-    chmod "$mode" "${ROOT_PREFIX}${path}" && info "chmod $mode $path"
+    old=$(stat -c '%a %U:%G' "${ROOT_PREFIX}${path}" 2>/dev/null)
+    chmod "$mode" "${ROOT_PREFIX}${path}" && info "chmod $mode $path (was: ${old:-unknown})"
 }
 
 fs_chown() {
@@ -133,31 +136,56 @@ has_authorized_keys() {
     home=$(user_home "$1")
     [[ -n "$home" ]] || return 1
     f="${ROOT_PREFIX}${home}/.ssh/authorized_keys"
-    [[ -s "$f" ]] && grep -qE '^(ssh-|ecdsa-|sk-)' "$f"
+    # A key line may start with options (from="...", command="..."), so the key type does not have to
+    # be the first word. Comment lines are ignored.
+    [[ -s "$f" ]] && grep -qE '^[[:space:]]*([^#[:space:]].*[[:space:]])?(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)[[:space:]]+AAAA' "$f"
+}
+warn_key_file_perms() {   # with StrictModes (the default) sshd ignores keys in a group/world-writable file
+    local home f mode
+    home=$(user_home "$1")
+    [[ -n "$home" ]] || return 0
+    f="${ROOT_PREFIX}${home}/.ssh/authorized_keys"
+    mode=$(stat -c %a "$f" 2>/dev/null) || return 0
+    if (( 8#$mode & 8#022 )); then
+        warn "$home/.ssh/authorized_keys is writable by group/others (mode $mode); sshd may ignore it. Fix: chmod 600"
+    fi
+    return 0
 }
 user_in_sudo() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qxE 'sudo|wheel|admin'; }
 will_be_created() { [[ -n "$CREATE_USER" && "$1" == "$CREATE_USER" ]]; }
 
-keys_ok() {   # the user already has a key, or one will be created in this run
+keys_ok() {   # the user already has a key, or the user step of this run will install one
     has_authorized_keys "$1" && return 0
-    will_be_created "$1" && [[ -n "$CREATE_USER_KEY" ]] && (( DRY_RUN )) && return 0
+    will_be_created "$1" && [[ -n "$CREATE_USER_KEY" ]] && step_selected user && (( DRY_RUN )) && return 0
     return 1
 }
-sudo_ok() { user_in_sudo "$1" || will_be_created "$1"; }
+sudo_ok() {   # the user is in a sudo group, or the user step of THIS run puts them there
+    user_in_sudo "$1" && return 0
+    will_be_created "$1" || return 1
+    step_selected user || return 1       # --create-user without the user step creates nobody
+    (( DRY_RUN || USER_STEP_OK ))        # for real, only trust a user step that has succeeded
+}
 
 find_sshd() {
     command -v sshd 2>/dev/null && return 0
     [[ -x /usr/sbin/sshd ]] && echo /usr/sbin/sshd
 }
 
-detect_ssh_port() {
+# Prints every port sshd listens on, one per line. Prints nothing when it cannot tell
+# (not root, sshd missing, fake root); the caller then falls back to 22.
+detect_ssh_ports() {
     if [[ -n "$SSH_PORT" ]]; then echo "$SSH_PORT"; return 0; fi
-    local p="" bin
+    [[ -z "$ROOT_PREFIX" ]] || return 0
+    local found="" bin
     bin=$(find_sshd)
-    if [[ -z "$ROOT_PREFIX" && -n "$bin" ]]; then
-        p=$("$bin" -T 2>/dev/null | awk '$1=="port"{print $2; exit}')
+    if [[ -n "$bin" ]]; then
+        found=$("$bin" -T 2>/dev/null | awk '$1=="port"{print $2}')
     fi
-    echo "${p:-22}"
+    if command -v ss >/dev/null 2>&1; then
+        # sudo removes SSH_CONNECTION from the environment, so also ask the kernel where sshd really listens
+        found+=$'\n'$(ss -H -ltnp 2>/dev/null | awk '/"sshd"/ { n = split($4, a, ":"); print a[n] }')
+    fi
+    awk '/^[0-9]+$/ && !seen[$0]++' <<<"$found"
 }
 
 # ------------------------------------------------------ content generators
@@ -207,11 +235,15 @@ install_key() {
     home=$(user_home "$user")
     [[ -n "$home" ]] || { err "No home directory found for $user"; return 1; }
     dir="${ROOT_PREFIX}${home}/.ssh"
-    mkdir -p "$dir" && chmod 700 "$dir"
-    touch "$dir/authorized_keys"
-    grep -qxF -- "$key" "$dir/authorized_keys" || printf '%s\n' "$key" >> "$dir/authorized_keys"
-    chmod 600 "$dir/authorized_keys"
-    [[ -z "$ROOT_PREFIX" ]] && chown -R "$user:" "$dir"
+    if ! mkdir -p "$dir" || ! chmod 700 "$dir"; then err "Could not create $home/.ssh"; return 1; fi
+    touch "$dir/authorized_keys" || { err "Could not create authorized_keys for $user"; return 1; }
+    if ! grep -qxF -- "$key" "$dir/authorized_keys"; then
+        printf '%s\n' "$key" >> "$dir/authorized_keys" || { err "Could not write the SSH key for $user"; return 1; }
+    fi
+    chmod 600 "$dir/authorized_keys" || { err "Could not set mode 600 on authorized_keys for $user"; return 1; }
+    if [[ -z "$ROOT_PREFIX" ]]; then
+        chown -R "$user:" "$dir" || { err "Could not hand $home/.ssh over to $user"; return 1; }
+    fi
     info "SSH key installed for: $user"
 }
 
@@ -226,10 +258,17 @@ step_user() {
         info "User already exists: $CREATE_USER"
     else
         run adduser --disabled-password --gecos "" "$CREATE_USER" || return 1
+        NEEDS_PASSWORD_USER="$CREATE_USER"
     fi
     run usermod -aG sudo "$CREATE_USER" || return 1
     if [[ -n "$CREATE_USER_KEY" ]]; then install_key "$CREATE_USER" "$CREATE_USER_KEY" || return 1; fi
-    info "Next step: set a password for sudo -> sudo passwd $CREATE_USER"
+    USER_STEP_OK=1
+    if [[ -n "$NEEDS_PASSWORD_USER" ]]; then
+        warn "$CREATE_USER is created WITHOUT a password, so sudo will not work for it yet."
+        warn "Set one before you close your root session: passwd $CREATE_USER"
+    else
+        info "Reminder: sudo asks for this account's password (set one with: sudo passwd $CREATE_USER)"
+    fi
 }
 
 verify_sshd() {
@@ -242,12 +281,23 @@ verify_sshd() {
     grep -qix 'permitemptypasswords no' <<<"$eff" || { err "Effective PermitEmptyPasswords is not 'no'"; return 1; }
     if (( ! KEEP_PASSWORD_AUTH )); then
         grep -qix 'passwordauthentication no' <<<"$eff" || { err "Effective PasswordAuthentication is not 'no' (overridden by another file?)"; return 1; }
+        if grep -qix 'kbdinteractiveauthentication yes' <<<"$eff"; then
+            warn "KbdInteractiveAuthentication is still 'yes': with PAM, passwords may still be accepted that way."
+            warn "Unless you need it (for example for 2FA), set 'KbdInteractiveAuthentication no' in sshd_config."
+        fi
     fi
+    return 0
 }
 
 reload_ssh() {
     local unit=sshd
     if systemctl cat ssh.service >/dev/null 2>&1; then unit=ssh; fi
+    # With socket activation (newer Ubuntu) the service only runs while someone is connected. If it is not
+    # running there is nothing to reload: the next connection starts sshd with the new configuration.
+    if ! systemctl is-active --quiet "$unit" 2>/dev/null; then
+        info "$unit.service is not running, nothing to reload (the new configuration applies to the next start)"
+        return 0
+    fi
     systemctl reload "$unit"
 }
 
@@ -274,9 +324,15 @@ step_ssh() {
     local main="${ROOT_PREFIX}/etc/ssh/sshd_config"
 
     [[ -f "$main" ]] || { err "/etc/ssh/sshd_config not found (is openssh-server installed?)"; return 1; }
-    if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$main"; then
+    # sshd keywords are case-insensitive and a relative path is resolved against /etc/ssh
+    if ! grep -qiE '^[[:space:]]*Include[[:space:]]+"?(/etc/ssh/)?sshd_config\.d/' "$main"; then
         err "sshd_config has no 'Include /etc/ssh/sshd_config.d/*.conf' line (needs Ubuntu 22.04+). The drop-in file would never be read."
         return 1
+    fi
+
+    if grep -qiE '^[[:space:]]*Match[[:space:]]' "$main" "${ROOT_PREFIX}"/etc/ssh/sshd_config.d/*.conf 2>/dev/null; then
+        warn "The SSH configuration contains 'Match' blocks. They can override these settings for some users or"
+        warn "hosts and are not checked here. Check a concrete case with: sshd -T -C user=NAME,host=HOST,addr=IP"
     fi
 
     if (( SKIP_CHECKS )); then
@@ -297,6 +353,7 @@ step_ssh() {
             err "Fix: sudo usermod -aG sudo $user"
             return 1
         fi
+        (( KEEP_PASSWORD_AUTH )) || warn_key_file_perms "$user"
     fi
 
     write_file "$conf" 644 "$(render_sshd_config)" || return 1
@@ -309,35 +366,58 @@ step_ssh() {
 }
 
 step_firewall() {
-    local port spec conn_port
-    port=$(detect_ssh_port)
-    valid_port "$port" || { err "Invalid SSH port: $port"; return 1; }
+    local ports port spec conn_port
+    ports=$(detect_ssh_ports)
+    if [[ -z "$ports" ]]; then
+        ports=22
+        if [[ -z "$ROOT_PREFIX" ]]; then
+            warn "Could not detect the sshd port (that needs root), assuming 22. If sshd listens elsewhere, pass --ssh-port N."
+        fi
+    fi
+    for port in $ports; do
+        valid_port "$port" || { err "Invalid SSH port: $port"; return 1; }
+    done
     for spec in ${ALLOW_PORTS[@]+"${ALLOW_PORTS[@]}"}; do
         valid_allow_spec "$spec" || { err "Invalid --allow value: $spec (example: 80/tcp)"; return 1; }
     done
 
     if ! command -v ufw >/dev/null 2>&1; then
+        # the package lists may be empty on a fresh image, and the updates step only runs later
+        run env DEBIAN_FRONTEND=noninteractive apt-get update || return 1
         run env DEBIAN_FRONTEND=noninteractive apt-get install -y ufw || return 1
     fi
-    run ufw default deny incoming || return 1
-    run ufw default allow outgoing || return 1
-    run ufw limit "${port}/tcp" || return 1          # the SSH port is allowed FIRST
 
-    # If the current SSH session is on a different port, open that one too (so we don't cut ourselves off)
+    # The SSH rules go in FIRST. If ufw is already active, the default policy below applies immediately.
+    for port in $ports; do
+        run ufw limit "${port}/tcp" || return 1
+    done
+    # If the current SSH session is on a different port, open that one too (so we don't cut ourselves off).
+    # sudo drops SSH_CONNECTION unless told to keep it, which is why the listening ports are detected above as well.
     conn_port=$(awk '{print $4}' <<<"${SSH_CONNECTION:-}")
-    if [[ -n "$conn_port" ]] && valid_port "$conn_port" && [[ "$conn_port" != "$port" ]]; then
+    if [[ -n "$conn_port" ]] && valid_port "$conn_port" && ! grep -qx -- "$conn_port" <<<"$ports"; then
         warn "The current SSH session is on port $conn_port, allowing that one too"
         run ufw limit "${conn_port}/tcp" || return 1
     fi
     for spec in ${ALLOW_PORTS[@]+"${ALLOW_PORTS[@]}"}; do
         run ufw allow "$spec" || return 1
     done
+    run ufw default deny incoming || return 1
+    run ufw default allow outgoing || return 1
     run ufw --force enable || return 1
     info "Check with: sudo ufw status verbose"
 }
 
 step_sysctl() {
     write_file /etc/sysctl.d/99-hardening.conf 644 "$(render_sysctl)" || return 1
+    # /etc/sysctl.conf (99-sysctl.conf) is read AFTER 99-hardening.conf, so a value set there wins
+    local key main_conf="${ROOT_PREFIX}/etc/sysctl.conf"
+    if [[ -r "$main_conf" ]]; then
+        while IFS= read -r key; do
+            if grep -qE "^[[:space:]]*${key//./\\.}[[:space:]]*=" "$main_conf"; then
+                warn "/etc/sysctl.conf also sets $key and is applied later, so its value wins. Remove that line there."
+            fi
+        done < <(render_sysctl | sed -nE 's/^([a-z][a-z0-9_.]+)[[:space:]]*=.*/\1/p')
+    fi
     run sysctl -p /etc/sysctl.d/99-hardening.conf || warn "Some settings could not be applied (normal inside a container)"
     return 0
 }
@@ -346,11 +426,11 @@ set_login_defs() {   # set_login_defs KEY VALUE
     local key="$1" value="$2" path="/etc/login.defs" target="${ROOT_PREFIX}/etc/login.defs"
     if (( DRY_RUN )); then info "[DRY-RUN] $path: $key = $value"; return 0; fi
     [[ -f "$target" ]] || { warn "$path not found"; return 1; }
-    backup_file "$path"
+    backup_file "$path" || return 1
     if grep -qE "^[[:space:]]*${key}[[:space:]]" "$target"; then
-        sed -i -E "s/^[[:space:]]*${key}[[:space:]]+.*/${key}\t${value}/" "$target"
+        sed -i -E "s/^[[:space:]]*${key}[[:space:]]+.*/${key}\t${value}/" "$target" || { err "Could not update $path"; return 1; }
     else
-        printf '%s\t%s\n' "$key" "$value" >> "$target"
+        printf '%s\t%s\n' "$key" "$value" >> "$target" || { err "Could not update $path"; return 1; }
     fi
     info "$path: $key = $value"
 }
@@ -431,11 +511,16 @@ parse_args() {
         shift
     done
 
-    local s
+    local s n=0
     if [[ "$SELECTED_STEPS" != "all" ]]; then
         for s in ${SELECTED_STEPS//,/ }; do
             [[ " ${ALL_STEPS[*]} " == *" $s "* ]] || die "Unknown step: $s (valid: ${ALL_STEPS[*]})"
+            n=$((n + 1))
         done
+        (( n > 0 )) || die "--steps needs at least one step (valid: ${ALL_STEPS[*]})"
+    fi
+    if [[ -n "$CREATE_USER_KEY" && -z "$CREATE_USER" ]]; then
+        die "--ssh-key only works together with --create-user (it is the key for the new account)"
     fi
     [[ -z "$SSH_PORT" ]] || valid_port "$SSH_PORT" || die "Invalid --ssh-port: $SSH_PORT"
     [[ -z "$SSH_USER" ]] || valid_username "$SSH_USER" || die "Invalid --ssh-user: $SSH_USER"
@@ -470,6 +555,10 @@ summary() {
     echo "================ SUMMARY ================"
     echo "Succeeded: ${DONE_STEPS[*]:-(none)}"
     echo "Failed   : ${FAILED_STEPS[*]:-(none)}"
+    if [[ -n "$NEEDS_PASSWORD_USER" ]]; then
+        echo "WARNING  : '$NEEDS_PASSWORD_USER' has no password, so it cannot use sudo yet."
+        echo "           Run 'passwd $NEEDS_PASSWORD_USER' as root BEFORE you close this session."
+    fi
     if (( DRY_RUN )); then
         echo "Mode     : DRY-RUN (nothing was changed). Add --apply to apply."
     else

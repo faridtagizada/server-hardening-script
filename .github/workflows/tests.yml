@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test suite
+        run: bash tests/run_tests.sh
+      - name: ShellCheck
+        run: shellcheck --severity=warning harden.sh tests/run_tests.sh tests/fakebin/sshd tests/fakebin/systemctl

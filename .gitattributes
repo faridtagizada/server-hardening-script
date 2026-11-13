@@ -1,0 +1,3 @@
+# Keep LF line endings everywhere, even when a file is edited on Windows.
+# A single CR at the end of harden.sh made bash run "\r" as a command (exit code 127).
+* text=auto eol=lf

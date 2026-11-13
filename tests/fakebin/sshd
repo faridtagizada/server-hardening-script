@@ -3,11 +3,10 @@
 case "${1:-}" in
     -t) [[ -n "${FAKE_SSHD_T_FAIL:-}" ]] && exit 1; exit 0 ;;
     -T)
-        echo "port 22"
+        for p in ${FAKE_SSHD_PORTS:-22}; do echo "port $p"; done
         echo "permitrootlogin no"
         echo "permitemptypasswords no"
         echo "passwordauthentication ${FAKE_PASSWORD_AUTH:-no}"
         exit 0 ;;
 esac
 exit 0
-

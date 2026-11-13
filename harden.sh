@@ -143,21 +143,58 @@ keys_ok() {   # the user already has a key, or one will be created in this run
     will_be_created "$1" && [[ -n "$CREATE_USER_KEY" ]] && (( DRY_RUN )) && return 0
     return 1
 }
-sudo_ok() { user_in_sudo "$1" || will_be_created "$1"; }
+# A user that "will be created" only counts in a dry run. With --apply the user step has
+# already run (or was not selected), so the real group membership decides.
+sudo_ok() { user_in_sudo "$1" || { will_be_created "$1" && (( DRY_RUN )); }; }
+
+# Being in the sudo group is not enough to keep admin access once root login is closed:
+# an account created with --disabled-password has no password to type at the sudo prompt.
+# Returns 0 = usable password or a NOPASSWD rule, 1 = sudo won't work, 2 = can't tell
+# (/etc/shadow is not readable, e.g. a dry run without root).
+sudo_password_state() {
+    local user="$1" shadow="${ROOT_PREFIX}/etc/shadow" hash
+    [[ -r "$shadow" ]] || return 2
+    hash=$(awk -F: -v u="$user" '$1 == u { print $2; exit }' "$shadow")
+    case "$hash" in
+        ''|'!'*|'*'*) ;;            # no password, locked (!) or no login (*)
+        *) return 0 ;;
+    esac
+    # Cloud images often have a user without a password but with "NOPASSWD: ALL"
+    if [[ -z "$ROOT_PREFIX" ]] && sudo -n -l -U "$user" 2>/dev/null | grep -qE 'NOPASSWD: *ALL'; then
+        return 0
+    fi
+    return 1
+}
 
 find_sshd() {
     command -v sshd 2>/dev/null && return 0
     [[ -x /usr/sbin/sshd ]] && echo /usr/sbin/sshd
 }
 
-detect_ssh_port() {
+# Every port sshd listens on (sshd -T prints one "port N" line per Port), one per line
+detect_ssh_ports() {
     if [[ -n "$SSH_PORT" ]]; then echo "$SSH_PORT"; return 0; fi
-    local p="" bin
+    local ports="" bin
     bin=$(find_sshd)
     if [[ -z "$ROOT_PREFIX" && -n "$bin" ]]; then
-        p=$("$bin" -T 2>/dev/null | awk '$1=="port"{print $2; exit}')
+        ports=$("$bin" -T 2>/dev/null | awk '$1 == "port" && !seen[$2]++ { print $2 }')
     fi
-    echo "${p:-22}"
+    echo "${ports:-22}"
+}
+
+# Local ports of the SSH sessions that are open right now, one per line.
+# sudo removes SSH_CONNECTION from the environment (env_reset), so the sockets of the
+# running sshd processes are read with ss as well.
+session_ports() {
+    {
+        awk '{ print $4 }' <<<"${SSH_CONNECTION:-}"
+        if [[ -z "$ROOT_PREFIX" ]] && command -v ss >/dev/null 2>&1; then
+            # The first "address:port" field of a line is the local end (with or without a State column)
+            ss -Htnp state established 2>/dev/null | awk '/"sshd/ {
+                for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) { n = split($i, a, ":"); print a[n]; break }
+            }'
+        fi
+    } | awk 'NF && !seen[$0]++'
 }
 
 # ------------------------------------------------------ content generators
@@ -230,6 +267,7 @@ step_user() {
     run usermod -aG sudo "$CREATE_USER" || return 1
     if [[ -n "$CREATE_USER_KEY" ]]; then install_key "$CREATE_USER" "$CREATE_USER_KEY" || return 1; fi
     info "Next step: set a password for sudo -> sudo passwd $CREATE_USER"
+    info "(the ssh step won't close root login until $CREATE_USER can actually use sudo)"
 }
 
 verify_sshd() {
@@ -297,6 +335,20 @@ step_ssh() {
             err "Fix: sudo usermod -aG sudo $user"
             return 1
         fi
+        if will_be_created "$user" && (( DRY_RUN )); then
+            warn "'$user' will be created without a password. Set one (sudo passwd $user) before the ssh step is applied, otherwise sudo won't work once root login is closed."
+        else
+            sudo_password_state "$user"
+            case $? in
+                0) ;;
+                1)
+                    err "'$user' has no usable password and no NOPASSWD sudo rule, so sudo won't work once root login is closed."
+                    err "Fix: sudo passwd $user  (then run the ssh step again)"
+                    return 1
+                    ;;
+                *) warn "Could not check whether '$user' can use sudo (/etc/shadow is not readable). With --apply this is checked as root." ;;
+            esac
+        fi
     fi
 
     write_file "$conf" 644 "$(render_sshd_config)" || return 1
@@ -309,9 +361,13 @@ step_ssh() {
 }
 
 step_firewall() {
-    local port spec conn_port
-    port=$(detect_ssh_port)
-    valid_port "$port" || { err "Invalid SSH port: $port"; return 1; }
+    local port spec
+    local -a ports=()
+    while IFS= read -r port; do
+        [[ -n "$port" ]] || continue
+        valid_port "$port" || { err "Invalid SSH port: $port"; return 1; }
+        ports+=("$port")
+    done < <(detect_ssh_ports)
     for spec in ${ALLOW_PORTS[@]+"${ALLOW_PORTS[@]}"}; do
         valid_allow_spec "$spec" || { err "Invalid --allow value: $spec (example: 80/tcp)"; return 1; }
     done
@@ -321,14 +377,19 @@ step_firewall() {
     fi
     run ufw default deny incoming || return 1
     run ufw default allow outgoing || return 1
-    run ufw limit "${port}/tcp" || return 1          # the SSH port is allowed FIRST
+    for port in "${ports[@]}"; do
+        run ufw limit "${port}/tcp" || return 1      # the SSH ports are allowed FIRST
+    done
 
-    # If the current SSH session is on a different port, open that one too (so we don't cut ourselves off)
-    conn_port=$(awk '{print $4}' <<<"${SSH_CONNECTION:-}")
-    if [[ -n "$conn_port" ]] && valid_port "$conn_port" && [[ "$conn_port" != "$port" ]]; then
-        warn "The current SSH session is on port $conn_port, allowing that one too"
-        run ufw limit "${conn_port}/tcp" || return 1
-    fi
+    # Open SSH sessions on another port (e.g. sshd moved but you're still connected on the old one)
+    # are kept too, so we don't cut ourselves off
+    while IFS= read -r port; do
+        valid_port "$port" || continue
+        [[ " ${ports[*]} " == *" $port "* ]] && continue
+        warn "An SSH session is open on port $port, allowing that one too"
+        run ufw limit "${port}/tcp" || return 1
+        ports+=("$port")
+    done < <(session_ports)
     for spec in ${ALLOW_PORTS[@]+"${ALLOW_PORTS[@]}"}; do
         run ufw allow "$spec" || return 1
     done
@@ -503,4 +564,3 @@ main() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     main "$@"
 fi
-

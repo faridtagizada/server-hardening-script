@@ -88,6 +88,51 @@ fi
   restore_file /etc/b.conf; [[ ! -e "$ROOT_PREFIX/etc/b.conf" ]] ) \
     && ok "restore_file: removes the new file when there is no backup" || fail "restore_file: removal"
 
+# Line endings and executable bits (a CR at the end of harden.sh made every run exit with 127)
+if grep -q $'\r' "$HARDEN" tests/run_tests.sh tests/fakebin/*; then fail "files: CR characters found"; else ok "files: no CR characters"; fi
+[[ -x "$HARDEN" && -x tests/fakebin/sshd && -x tests/fakebin/systemctl && -x tests/fakebin/ss ]] \
+    && ok "files: scripts are executable" || fail "files: a script is not executable (git update-index --chmod=+x)"
+
+# sudo_password_state: can the user really use sudo? (reads the fake /etc/shadow)
+pw="$WORK/pw"; mkdir -p "$pw/etc"
+# shellcheck disable=SC2016  # the $ signs are part of the fake password hashes
+printf '%s\n' 'good:$6$salt$hash:19000:0:99999:7:::' 'locked:!:19000:0:99999:7:::' \
+    'lockedhash:!$6$salt$hash:19000:0:99999:7:::' 'nologin:*:19000:0:99999:7:::' \
+    'empty::19000:0:99999:7:::' > "$pw/etc/shadow"
+pw_state() { ( ROOT_PREFIX="$1"; sudo_password_state "$2" ); echo "$?"; }
+[[ "$(pw_state "$pw" good)" == 0 ]] && ok "sudo password: a real hash counts" || fail "sudo password: good"
+for u in locked lockedhash nologin empty missing; do
+    [[ "$(pw_state "$pw" "$u")" == 1 ]] && ok "sudo password: '$u' can't use sudo" || fail "sudo password: $u"
+done
+[[ "$(pw_state "$WORK/no-shadow" good)" == 2 ]] && ok "sudo password: unreadable shadow -> can't tell" || fail "sudo password: unreadable shadow"
+
+# sudo_ok: a user that "will be created" only counts in a dry run
+nouser="harden-test-nouser"
+( CREATE_USER="$nouser"; DRY_RUN=1; sudo_ok "$nouser" ) \
+    && ok "sudo_ok: a user created in this run counts in a dry run" || fail "sudo_ok: dry run"
+( CREATE_USER="$nouser"; DRY_RUN=0; sudo_ok "$nouser" ) \
+    && fail "sudo_ok: with --apply a user that doesn't exist was accepted" || ok "sudo_ok: with --apply only real sudo membership counts"
+
+# step_ssh: root login is not closed while the sudo user can't actually use sudo
+ssh_case() {   # ssh_case PASSWORD_FIELD -> prints the return code of step_ssh
+    local r="$WORK/sshpw-$RANDOM"; mkroot "$r"
+    echo "tester:$1:19000:0:99999:7:::" >> "$r/etc/shadow"
+    ( ROOT_PREFIX="$r"; DRY_RUN=0; SSH_USER="tester"; KEEP_PASSWORD_AUTH=1
+      user_in_sudo() { return 0; }
+      step_ssh >/dev/null 2>&1; echo "$?" )
+}
+[[ "$(ssh_case '!')" != 0 ]] && ok "ssh step: refused when the sudo user has no password" || fail "ssh step: a locked password was accepted"
+# shellcheck disable=SC2016
+[[ "$(ssh_case '$6$salt$hash')" == 0 ]] && ok "ssh step: passes when the sudo user has a password" || fail "ssh step: a real password was refused"
+
+# session_ports: SSH_CONNECTION and/or the sockets of the running sshd processes (fake ss)
+out=$( unset SSH_CONNECTION; PATH="$FAKEBIN:$PATH"; session_ports )
+[[ "$out" == $'2200\n2201' ]] && ok "session_ports: read from ss (IPv4 + IPv6, other programs ignored)" || fail "session_ports: ss" "$out"
+out=$( unset SSH_CONNECTION; export FAKE_SS_STATE_COLUMN=1; PATH="$FAKEBIN:$PATH"; session_ports )
+[[ "$out" == $'2200\n2201' ]] && ok "session_ports: works with a State column too" || fail "session_ports: State column" "$out"
+out=$( export SSH_CONNECTION="1.2.3.4 5555 5.6.7.8 2200"; PATH="$FAKEBIN:$PATH"; session_ports )
+[[ "$out" == $'2200\n2201' ]] && ok "session_ports: SSH_CONNECTION + ss without duplicates" || fail "session_ports: duplicates" "$out"
+
 # ---------------------------------------- finalize_ssh_change (with a fake sshd)
 finalize_case() {   # finalize_case NAME EXPECTED(ok|rollback) [ENV=...]
     local name="$1" expect="$2"; shift 2
@@ -127,6 +172,15 @@ out=$(H --steps firewall --ssh-port 2222 2>&1)
 has "$out" "ufw limit 2222/tcp" && ok "firewall: --ssh-port 2222" || fail "firewall: --ssh-port" "$out"
 out=$(SSH_CONNECTION="1.2.3.4 5555 5.6.7.8 2200" H --steps firewall 2>&1)
 has "$out" "ufw limit 2200/tcp" && ok "firewall: the current session's port is opened too" || fail "firewall: session port" "$out"
+# Under sudo SSH_CONNECTION is gone: the session port must still be found (fake ss)
+out=$(env -u SSH_CONNECTION PATH="$FAKEBIN:$PATH" "$HARDEN" --steps firewall 2>&1)
+l_s=$(grep -n 'ufw limit 2200/tcp' <<<"$out" | head -1 | cut -d: -f1)
+l_en=$(grep -n 'ufw --force enable' <<<"$out" | head -1 | cut -d: -f1)
+[[ -n "$l_s" && -n "$l_en" && "$l_s" -lt "$l_en" ]] && ok "firewall: session port found without SSH_CONNECTION (sudo)" || fail "firewall: session port via ss" "$out"
+# Every port sshd listens on is allowed, not only the first one
+out=$(env -u SSH_CONNECTION PATH="$FAKEBIN:$PATH" FAKE_SSHD_PORTS="22 2222" FAKE_SS_PORT=22 FAKE_SS_PORT6=22 "$HARDEN" --steps firewall 2>&1)
+has "$out" "ufw limit 22/tcp" && has "$out" "ufw limit 2222/tcp" && ok "firewall: all sshd ports are allowed" || fail "firewall: sshd ports" "$out"
+has "$out" "An SSH session is open" && fail "firewall: a port already allowed was added twice" "$out" || ok "firewall: no duplicate rule for the session port"
 
 # Safeguard: password login can't be disabled without a key
 r="$WORK/guard"; mkroot "$r"
@@ -139,6 +193,8 @@ has "$out" "authorized_keys" && ok "safeguard: the reason is explained" || fail 
 if [[ -n "$home" ]]; then
     r="$WORK/guard2"; mkroot "$r"; mkdir -p "$r$home/.ssh"
     echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample" > "$r$home/.ssh/authorized_keys"
+    sed -i "/^$me:/d" "$r/etc/shadow"
+    echo "$me:\$6\$salt\$hash:19000:0:99999:7:::" >> "$r/etc/shadow"   # a password, so sudo would work
     out=$(ROOT_PREFIX="$r" H --apply -y --steps ssh --ssh-user "$me" 2>&1); rc=$?
     if user_in_sudo "$me"; then
         [[ $rc -eq 0 && -e "$r/etc/ssh/sshd_config.d/00-hardening.conf" ]] && ok "safeguard: key + sudo -> ssh step passes" || fail "safeguard: should have passed" "$out"
@@ -196,4 +252,3 @@ fi
 echo
 echo "Result: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]
-

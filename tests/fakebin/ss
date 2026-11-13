@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Fake ss for tests: prints established connections like "ss -Htnp state established".
+# FAKE_SS_STATE_COLUMN=1 adds the State column that some ss versions print.
+state=""
+[[ -n "${FAKE_SS_STATE_COLUMN:-}" ]] && state="ESTAB  "
+echo "${state}0      0      10.0.0.5:${FAKE_SS_PORT:-2200}      203.0.113.7:51234 users:((\"sshd\",pid=1234,fd=4),(\"sshd\",pid=1200,fd=4))"
+echo "${state}0      0      [2001:db8::5]:${FAKE_SS_PORT6:-2201}      [2001:db8::7]:40000 users:((\"sshd-session\",pid=1300,fd=4))"
+echo "${state}0      0      10.0.0.5:443      203.0.113.9:50000 users:((\"nginx\",pid=900,fd=12))"
+exit 0

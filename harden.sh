@@ -106,9 +106,31 @@ write_file() {   # write_file PATH MODE CONTENT
     info "Written: $path"
 }
 
+# record_permissions PATH: before the first chmod/chown of PATH in this run, its mode and owner go
+# into restore-permissions.sh in the backup directory. Running that script puts them back.
+declare -A PERMS_RECORDED=()
+record_permissions() {
+    local path="$1" target="${ROOT_PREFIX}$1" mode owner script
+    [[ -n "${PERMS_RECORDED[$path]:-}" ]] && return 0
+    mode=$(stat -c %a "$target" 2>/dev/null) && owner=$(stat -c %U:%G "$target" 2>/dev/null) \
+        || { err "Could not read the mode and owner of $path"; return 1; }
+    init_backup_dir
+    script="${BACKUP_DIR}/restore-permissions.sh"
+    if [[ ! -e "$script" ]]; then
+        mkdir -p "$BACKUP_DIR" \
+            && printf '#!/bin/sh\n# Written by harden.sh: puts back the modes and owners the perms step changed.\n' > "$script" \
+            && chmod 700 "$script" \
+            || { err "Could not create $script"; return 1; }
+    fi
+    printf 'chmod %s %s\nchown %s %s\n' "$mode" "$path" "$owner" "$path" >> "$script" \
+        || { err "Could not write $script"; return 1; }
+    PERMS_RECORDED[$path]=1
+}
+
 fs_chmod() {
     local path="$1" mode="$2" old
     if (( DRY_RUN )); then info "[DRY-RUN] chmod $mode $path"; return 0; fi
+    record_permissions "$path" || return 1      # never change what could not be recorded
     old=$(stat -c '%a %U:%G' "${ROOT_PREFIX}${path}" 2>/dev/null)
     chmod "$mode" "${ROOT_PREFIX}${path}" && info "chmod $mode $path (was: ${old:-unknown})"
 }
@@ -118,6 +140,7 @@ fs_chown() {
     if [[ "$grp" == "shadow" ]] && ! getent group shadow >/dev/null 2>&1; then grp="root"; fi
     if (( DRY_RUN )); then info "[DRY-RUN] chown $owner:$grp $path"; return 0; fi
     [[ -n "$ROOT_PREFIX" ]] && return 0
+    record_permissions "$path" || return 1
     chown "$owner:$grp" "$path" && info "chown $owner:$grp $path"
 }
 
@@ -131,24 +154,64 @@ confirm() {
 # ------------------------------------------------------ user helpers
 user_home() { getent passwd "$1" | cut -d: -f6; }
 
+# authorized_keys_files USER: the files sshd takes this user's keys from (AuthorizedKeysFile, by default
+# .ssh/authorized_keys and .ssh/authorized_keys2), one absolute path per line, %h %u %U %% expanded.
+# The effective value comes from "sshd -T" (needs root); otherwise it is read from the config files.
+authorized_keys_files() {
+    local user="$1" home uid spec="" bin f
+    home=$(user_home "$user")
+    [[ -n "$home" ]] || return 0
+    uid=$(getent passwd "$user" | cut -d: -f3)
+    if [[ -z "$ROOT_PREFIX" ]]; then
+        bin=$(find_sshd)
+        if [[ -n "$bin" ]]; then
+            spec=$("$bin" -T -C "user=$user,host=localhost,addr=127.0.0.1" 2>/dev/null \
+                | awk '$1 == "authorizedkeysfile" { $1 = ""; print; exit }')
+        fi
+    fi
+    if [[ -z "$spec" ]]; then
+        # Ubuntu's sshd_config starts with the Include line, so the drop-ins are read first; the first
+        # value outside a Match block wins
+        local -a conf_files=()
+        for f in "${ROOT_PREFIX}"/etc/ssh/sshd_config.d/*.conf "${ROOT_PREFIX}/etc/ssh/sshd_config"; do
+            [[ -r "$f" ]] && conf_files+=("$f")
+        done
+        if (( ${#conf_files[@]} )); then
+            spec=$(awk 'FNR == 1 { in_match = 0 }
+                        tolower($1) == "match" { in_match = 1 }
+                        !in_match && tolower($1) == "authorizedkeysfile" { $1 = ""; print; exit }' "${conf_files[@]}")
+        fi
+    fi
+    [[ -n "${spec// /}" ]] || spec=".ssh/authorized_keys .ssh/authorized_keys2"
+    local -a parts=()
+    read -ra parts <<<"$spec"
+    for f in "${parts[@]}"; do
+        [[ "${f,,}" == "none" ]] && continue
+        f=${f//%%/$'\x01'}; f=${f//%h/$home}; f=${f//%u/$user}; f=${f//%U/$uid}; f=${f//$'\x01'/%}
+        [[ "$f" == /* ]] || f="$home/$f"
+        printf '%s\n' "$f"
+    done
+}
+
 has_authorized_keys() {
-    local home f
-    home=$(user_home "$1")
-    [[ -n "$home" ]] || return 1
-    f="${ROOT_PREFIX}${home}/.ssh/authorized_keys"
-    # A key line may start with options (from="...", command="..."), so the key type does not have to
-    # be the first word. Comment lines are ignored.
-    [[ -s "$f" ]] && grep -qE '^[[:space:]]*([^#[:space:]].*[[:space:]])?(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)[[:space:]]+AAAA' "$f"
+    local f
+    while IFS= read -r f; do
+        f="${ROOT_PREFIX}$f"
+        # A key line may start with options (from="...", command="..."), so the key type does not have to
+        # be the first word. Comment lines are ignored.
+        [[ -s "$f" ]] && grep -qE '^[[:space:]]*([^#[:space:]].*[[:space:]])?(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)[[:space:]]+AAAA' "$f" \
+            && return 0
+    done < <(authorized_keys_files "$1")
+    return 1
 }
 warn_key_file_perms() {   # with StrictModes (the default) sshd ignores keys in a group/world-writable file
-    local home f mode
-    home=$(user_home "$1")
-    [[ -n "$home" ]] || return 0
-    f="${ROOT_PREFIX}${home}/.ssh/authorized_keys"
-    mode=$(stat -c %a "$f" 2>/dev/null) || return 0
-    if (( 8#$mode & 8#022 )); then
-        warn "$home/.ssh/authorized_keys is writable by group/others (mode $mode); sshd may ignore it. Fix: chmod 600"
-    fi
+    local f mode
+    while IFS= read -r f; do
+        mode=$(stat -c %a "${ROOT_PREFIX}$f" 2>/dev/null) || continue
+        if (( 8#$mode & 8#022 )); then
+            warn "$f is writable by group/others (mode $mode); sshd may ignore it. Fix: chmod 600 $f"
+        fi
+    done < <(authorized_keys_files "$1")
     return 0
 }
 user_in_sudo() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qxE 'sudo|wheel|admin'; }
@@ -226,6 +289,27 @@ net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 kernel.randomize_va_space = 2
 SYSCTL_BODY
+    # "all" and "default" are not enough for redirects: a host takes a redirect on an interface when
+    # "all" OR the interface's own value is 1, and "default" only reaches interfaces created later.
+    # So each interface that exists now gets its own lines. Short-lived virtual interfaces (containers,
+    # VMs) are left out: they are created later and start from "default".
+    local dir name header=0
+    for dir in "${ROOT_PREFIX}"/proc/sys/net/ipv4/conf/*/; do
+        [[ -d "$dir" ]] || continue
+        name=$(basename "$dir")
+        case "$name" in all|default|lo|veth*|tap*|lxc*|cali*) continue ;; esac
+        if (( ! header )); then echo "# interfaces that exist now"; header=1; fi
+        echo "$(iface_key ipv4 "$name" accept_redirects) = 0"
+        echo "$(iface_key ipv4 "$name" send_redirects) = 0"
+        if [[ -d "${ROOT_PREFIX}/proc/sys/net/ipv6/conf/$name" ]]; then
+            echo "$(iface_key ipv6 "$name" accept_redirects) = 0"
+        fi
+    done
+}
+
+iface_key() {   # iface_key ipv4 eth0 accept_redirects -> net.ipv4.conf.eth0.accept_redirects
+    # a name with a dot in it (a VLAN such as eth0.100) needs the form with slashes
+    if [[ "$2" == *.* ]]; then echo "net/$1/conf/$2/$3"; else echo "net.$1.conf.$2.$3"; fi
 }
 
 # --------------------------------------------------------------- steps

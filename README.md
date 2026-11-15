@@ -12,20 +12,20 @@ This edits your SSH and firewall configuration, and a mistake there can lock you
 
 | | Score | PASS | FAIL | WARN |
 |---|---|---|---|---|
-| Before | 9/100 | 0 | 9 | 4 |
-| After | 78/100 | 11 | 2 | 0 |
+| Before | 12/100 | 0 | 9 | 5 |
+| After | 77/100 | 11 | 2 | 1 |
 
-The two FAILs that remain, an extra account with UID 0 and an account with an empty password, are left alone on purpose. Deleting or changing accounts automatically is risky, so that decision is yours.
+What remains is left alone on purpose: the two FAILs (an extra account with UID 0 and an account with an empty password) and the WARN for an existing account whose password never expires. Deleting or changing accounts automatically is risky, and `chage -M 90` on an old password would expire it at once, so those decisions are yours.
 
 ## Safeguards
 
 - Dry run is the default.
-- Password login is only turned off if the user you name with `--ssh-user` already has a key in `authorized_keys`.
+- Password login is only turned off if the user you name with `--ssh-user` already has a key in a file `sshd` reads keys from: `~/.ssh/authorized_keys` or `authorized_keys2` by default, or the paths set with `AuthorizedKeysFile` (read from `sshd -T`).
 - Root login is only closed if there is a user with sudo rights. `--create-user` only counts for that when the `user` step runs in the same invocation and succeeds.
 - An account created with `--create-user` has no password, so `sudo` does not work for it until you run `passwd NAME`. The script warns about this in the `user` step and again in the summary.
 - After writing the SSH config the script runs `sshd -t` and `sshd -T` and looks at the effective values. If `sshd -t` fails, if another file overrides the setting, or if the reload fails, the change is rolled back.
 - In `ufw` the SSH rules are added first, before the default-deny policy and before the firewall is enabled. Every port `sshd` listens on is allowed (read from `sshd -T` and from the listening sockets), and so is the port of your current session when `SSH_CONNECTION` is available. Plain `sudo` removes that variable, which is why the listening ports are checked as well.
-- Every file it changes is copied to `/var/backups/harden-<date>/` first, and a step fails if that copy or the write itself fails. The `perms` step only changes modes and owners; it writes the previous values to `/var/log/harden.log`.
+- Every file it changes is copied to `/var/backups/harden-<date>/` first, and a step fails if that copy or the write itself fails. The `perms` step only changes modes and owners; before it does, the old values go into `restore-permissions.sh` in the same backup folder (and into `/var/log/harden.log`).
 - Usernames, ports, SSH keys and `--allow` values are validated.
 - Everything is logged to `/var/log/harden.log`.
 
@@ -40,7 +40,7 @@ In sshd the first value that gets set is the one that counts. On Ubuntu, `sshd_c
 | `user` | With `--create-user`, creates a sudo user and optionally installs an SSH key |
 | `ssh` | `PermitRootLogin no`, `PasswordAuthentication no`, `PermitEmptyPasswords no`, `X11Forwarding no`, `MaxAuthTries 3`, `LoginGraceTime 30`, `ClientAlive*` |
 | `firewall` | `ufw`: deny incoming, allow outgoing, `ufw limit` on SSH (rate limiting against brute force), plus any extra ports |
-| `sysctl` | SYN cookies, no ICMP redirects or source routing, `rp_filter`, `log_martians`, ASLR |
+| `sysctl` | SYN cookies, no ICMP redirects or source routing, `rp_filter`, `log_martians`, ASLR. Redirects are also turned off for each network interface that already exists, because `default` only reaches interfaces created later |
 | `passwords` | `/etc/login.defs`: `PASS_MAX_DAYS 90`, `PASS_MIN_DAYS 1`, `PASS_WARN_AGE 7` |
 | `perms` | `passwd` and `group` 644, `shadow` and `gshadow` 640, `sshd_config` 600 |
 | `updates` | Installs and enables `unattended-upgrades` |
@@ -187,7 +187,7 @@ ls /var/backups/harden-*/
 sudo rm /etc/ssh/sshd_config.d/00-hardening.conf
 sudo sshd -t && sudo systemctl reload ssh
 
-# undo the sysctl change
+# undo the sysctl change (the old values are back after a reboot; until then the current ones stay)
 sudo rm /etc/sysctl.d/99-hardening.conf && sudo sysctl --system
 
 # turn the firewall off
@@ -195,6 +195,17 @@ sudo ufw disable
 
 # restore login.defs
 sudo cp /var/backups/harden-<date>/etc/login.defs /etc/login.defs
+
+# put back the old file modes and owners (perms step)
+sudo sh /var/backups/harden-<date>/restore-permissions.sh
+
+# automatic updates (updates step): copy back the old 20auto-upgrades if the backup has one ...
+sudo cp /var/backups/harden-<date>/etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/
+# ... and if it has none, the file is new: delete it instead (unattended-upgrades ships with Ubuntu, keep it)
+# sudo rm /etc/apt/apt.conf.d/20auto-upgrades
+
+# the account made with --create-user (user step)
+sudo deluser --remove-home NAME
 ```
 
 If you do get locked out of SSH, log in from the VM console and run the commands above.
@@ -202,7 +213,7 @@ If you do get locked out of SSH, log in from the VM console and run the commands
 ## Tests
 
 ```bash
-bash tests/run_tests.sh      # 96 tests
+bash tests/run_tests.sh      # 107 tests (106 as root)
 shellcheck harden.sh tests/run_tests.sh
 ```
 
@@ -232,6 +243,7 @@ sudo ./harden.sh --apply --ssh-user $USER          # 6. run it again, nothing sh
 - `Match` blocks in the SSH configuration are not evaluated. The script warns when it finds one; check a concrete case with `sshd -T -C user=NAME,host=HOST,addr=IP`.
 - `KbdInteractiveAuthentication` is not changed, because some setups need it for 2FA. If it is still `yes` after the run, the script warns that passwords may still be accepted through PAM.
 - Values set in `/etc/sysctl.conf` are applied after `99-hardening.conf` and win. The script warns when it finds one of its keys there.
+- Keys that come from an `AuthorizedKeysCommand` (LDAP, a certificate authority) are not seen. The key check then refuses to turn off password login; use `--keep-password-auth`, or `--skip-checks` if you are sure.
 - It covers the basics and is not a replacement for the full CIS Benchmark.
 
 ## Layout
@@ -240,7 +252,7 @@ sudo ./harden.sh --apply --ssh-user $USER          # 6. run it again, nothing sh
 server-hardening-script/
 ├── harden.sh                 # the script
 └── tests/
-    ├── run_tests.sh          # 96 tests
+    ├── run_tests.sh          # 107 tests
     └── fakebin/              # fake sshd and systemctl
 ```
 

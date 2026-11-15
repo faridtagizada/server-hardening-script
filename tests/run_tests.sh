@@ -73,6 +73,14 @@ out=$(KEEP_PASSWORD_AUTH=1 render_sshd_config)
 grep -q '^PasswordAuthentication' <<<"$out" && fail "--keep-password-auth: there must be no PasswordAuthentication directive" || ok "--keep-password-auth: PasswordAuthentication is not written"
 has "$(render_sysctl)" "net.ipv4.tcp_syncookies = 1" && ok "sysctl: syncookies" || fail "sysctl: syncookies"
 grep -E '^net\.ipv4\.ip_forward' <<<"$(render_sysctl)" >/dev/null && fail "sysctl: must not touch ip_forward" || ok "sysctl: ip_forward is left alone"
+# "default" only reaches interfaces created later, so the existing ones get their own lines
+for i in all default lo eth0 eth0.100 veth1a2b; do mkdir -p "$WORK/ifs/proc/sys/net/ipv4/conf/$i"; done
+mkdir -p "$WORK/ifs/proc/sys/net/ipv6/conf/eth0"
+out=$(ROOT_PREFIX="$WORK/ifs" render_sysctl)
+has "$out" "net.ipv4.conf.eth0.accept_redirects = 0" && ok "sysctl: an existing interface gets its own line" || fail "sysctl: eth0" "$out"
+has "$out" "net.ipv6.conf.eth0.accept_redirects = 0" && ok "sysctl: ... for IPv6 too" || fail "sysctl: eth0 IPv6" "$out"
+has "$out" "net/ipv4/conf/eth0.100/send_redirects = 0" && ok "sysctl: a VLAN name with a dot uses slashes" || fail "sysctl: eth0.100" "$out"
+grep -qE 'conf[./](lo|veth1a2b)[./]' <<<"$out" && fail "sysctl: lo and veth* must be left out" "$out" || ok "sysctl: lo and short-lived veth interfaces are left out"
 
 # has_authorized_keys
 me="$(id -un)"
@@ -87,7 +95,18 @@ if [[ -n "$home" ]]; then
       echo 'from="10.0.0.0/8",no-pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample' > "$ROOT_PREFIX$home/.ssh/authorized_keys"
       t  "has_authorized_keys: key with options" has_authorized_keys "$me"
       echo '# ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample (disabled)' > "$ROOT_PREFIX$home/.ssh/authorized_keys"
-      tn "has_authorized_keys: commented-out key" has_authorized_keys "$me" ) > "$WORK/hk.out"
+      tn "has_authorized_keys: commented-out key" has_authorized_keys "$me"
+      echo "sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhExample" > "$ROOT_PREFIX$home/.ssh/authorized_keys2"
+      t  "has_authorized_keys: authorized_keys2 (also read by default)" has_authorized_keys "$me"
+      rm -f "$ROOT_PREFIX$home/.ssh/authorized_keys2"
+      # keys kept outside the home directory, as some setups do with AuthorizedKeysFile
+      mkdir -p "$ROOT_PREFIX/etc/ssh/sshd_config.d" "$ROOT_PREFIX/etc/ssh/keys"
+      echo 'AuthorizedKeysFile /etc/ssh/keys/%u' > "$ROOT_PREFIX/etc/ssh/sshd_config.d/10-keys.conf"
+      tn "has_authorized_keys: AuthorizedKeysFile without a key" has_authorized_keys "$me"
+      echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample" > "$ROOT_PREFIX/etc/ssh/keys/$me"
+      t  "has_authorized_keys: key in the AuthorizedKeysFile path" has_authorized_keys "$me"
+      printf 'Match User nobody\n    AuthorizedKeysFile /nowhere/%%u\n' > "$ROOT_PREFIX/etc/ssh/sshd_config.d/05-match.conf"
+      t  "has_authorized_keys: a Match block does not change the global path" has_authorized_keys "$me" ) > "$WORK/hk.out"
     cat "$WORK/hk.out"; PASS=$((PASS + $(grep -c '^ok' "$WORK/hk.out"))); FAIL=$((FAIL + $(grep -c '^FAIL' "$WORK/hk.out")))
 fi
 
@@ -203,6 +222,10 @@ for pair in "passwd:644" "group:644" "shadow:640" "gshadow:640" "ssh/sshd_config
     f="${pair%%:*}"; m="${pair##*:}"
     [[ "$(mode "$r/etc/$f")" == "$m" ]] && ok "apply: /etc/$f -> $m" || fail "apply: /etc/$f has mode $(mode "$r/etc/$f"), expected $m"
 done
+restore=$(find "$r/var/backups" -name restore-permissions.sh 2>/dev/null | head -1)
+[[ -n "$restore" ]] && grep -qx 'chmod 666 /etc/passwd' "$restore" && grep -qx 'chmod 644 /etc/shadow' "$restore" \
+    && ok "apply: the old modes are saved in restore-permissions.sh" || fail "apply: restore-permissions.sh" "$(cat "$restore" 2>/dev/null)"
+[[ -n "$restore" && -x "$restore" ]] && ok "apply: restore-permissions.sh is executable" || fail "apply: restore-permissions.sh mode"
 bk=$(find "$r/var/backups" -path '*etc/login.defs' 2>/dev/null | head -1)
 [[ -n "$bk" ]] && grep -q 'PASS_MAX_DAYS.*99999' "$bk" && ok "apply: original login.defs was backed up" || fail "apply: no backup"
 [[ -s "$r/var/log/harden.log" ]] && ok "apply: log file written" || fail "apply: no log"

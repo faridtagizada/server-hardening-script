@@ -110,6 +110,14 @@ if [[ -n "$home" ]]; then
     cat "$WORK/hk.out"; PASS=$((PASS + $(grep -c '^ok' "$WORK/hk.out"))); FAIL=$((FAIL + $(grep -c '^FAIL' "$WORK/hk.out")))
 fi
 
+# sudo_password_state: 0 = sudo can ask for a password, 1 = it can't, 2 = /etc/shadow can't be read
+( ROOT_PREFIX="$WORK/sp"; mkdir -p "$ROOT_PREFIX/etc"
+  printf 'ali:$6$salt$hash:19000:0:99999:7:::\nnokey:!:19000:0:99999:7:::\nstar:*:19000:0:99999:7:::\n' > "$ROOT_PREFIX/etc/shadow"
+  sudo_password_state ali; a=$?; sudo_password_state nokey; b=$?; sudo_password_state star; c=$?
+  sudo_password_state nobody-here; d=$?; rm "$ROOT_PREFIX/etc/shadow"; sudo_password_state ali; e=$?
+  [[ "$a$b$c$d$e" == "01112" ]] ) && ok "sudo_password_state: password / locked / * / missing / unreadable" \
+    || fail "sudo_password_state"
+
 # restore_file
 ( ROOT_PREFIX="$WORK/rf"; BACKUP_DIR="$ROOT_PREFIX/bk"; mkdir -p "$ROOT_PREFIX/etc" "$BACKUP_DIR/etc"
   echo original > "$BACKUP_DIR/etc/a.conf"; echo changed > "$ROOT_PREFIX/etc/a.conf"
@@ -172,16 +180,24 @@ has "$out" "authorized_keys" && ok "safeguard: the reason is explained" || fail 
 if [[ -n "$home" ]]; then
     r="$WORK/guard2"; mkroot "$r"; mkdir -p "$r$home/.ssh"
     echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample" > "$r$home/.ssh/authorized_keys"
+    echo "$me:\$6\$salt\$hash:19000:0:99999:7:::" >> "$r/etc/shadow"     # a password sudo can ask for
     out=$(ROOT_PREFIX="$r" H --apply -y --steps ssh --ssh-user "$me" 2>&1); rc=$?
     if user_in_sudo "$me"; then
         [[ $rc -eq 0 && -e "$r/etc/ssh/sshd_config.d/00-hardening.conf" ]] && ok "safeguard: key + sudo -> ssh step passes" || fail "safeguard: should have passed" "$out"
+        # in the sudo group, but without a password sudo can't be used: root login must stay open
+        r="$WORK/guard3"; mkroot "$r"; mkdir -p "$r$home/.ssh"
+        cp "$WORK/guard2$home/.ssh/authorized_keys" "$r$home/.ssh/"
+        echo "$me:!:19000:0:99999:7:::" >> "$r/etc/shadow"
+        out=$(ROOT_PREFIX="$r" H --apply -y --steps ssh --ssh-user "$me" 2>&1); rc=$?
+        [[ $rc -ne 0 && ! -e "$r/etc/ssh/sshd_config.d/00-hardening.conf" ]] && has "$out" "no usable password" \
+            && ok "safeguard: a sudo user without a password does not close root login" || fail "safeguard: no password" "$out"
     else
         [[ $rc -ne 0 ]] && has "$out" "not in the sudo group" && ok "safeguard: rejects a user who is not in sudo" || fail "safeguard: sudo check" "$out"
     fi
 fi
 
 # --keep-password-auth doesn't need a key (only sudo is checked) -> without sudo it is refused
-r="$WORK/keep"; mkroot "$r"
+r="$WORK/keep"; mkroot "$r"; echo "$me:\$6\$salt\$hash:19000:0:99999:7:::" >> "$r/etc/shadow"
 out=$(ROOT_PREFIX="$r" H --apply -y --steps ssh --ssh-user "$me" --keep-password-auth 2>&1); rc=$?
 if user_in_sudo "$me"; then
     [[ $rc -eq 0 ]] && ! grep -q '^PasswordAuthentication' "$r/etc/ssh/sshd_config.d/00-hardening.conf" \
@@ -189,6 +205,12 @@ if user_in_sudo "$me"; then
 else
     [[ $rc -ne 0 ]] && has "$out" "not in the sudo group" && ok "--keep-password-auth: still refused without sudo" || fail "--keep-password-auth: sudo check" "$out"
 fi
+
+# A dry run with --create-user says that the account needs a password before root login can be closed
+r="$WORK/newuser"; mkroot "$r"
+out=$(ROOT_PREFIX="$r" H --steps user,ssh --create-user zznew --ssh-key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample" 2>&1); rc=$?
+[[ $rc -eq 0 ]] && has "$out" "will be created without a password" \
+    && ok "dry run: --create-user warns that sudo needs a password first" || fail "dry run: --create-user password warning" "$out"
 
 # --create-user must not count as "has sudo" unless the user step really creates the account in this run
 r="$WORK/nouser"; mkroot "$r"

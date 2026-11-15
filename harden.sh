@@ -229,6 +229,25 @@ sudo_ok() {   # the user is in a sudo group, or the user step of THIS run puts t
     (( DRY_RUN || USER_STEP_OK ))        # for real, only trust a user step that has succeeded
 }
 
+# sudo_password_state USER: being in the sudo group is not enough to keep admin access once root login
+# is closed, because sudo asks for the account's password. An account made with --disabled-password
+# has none. Returns 0 = a usable password or a NOPASSWD rule, 1 = sudo won't work, 2 = can't tell
+# (/etc/shadow is not readable, e.g. a dry run without root).
+sudo_password_state() {
+    local user="$1" shadow="${ROOT_PREFIX}/etc/shadow" hash
+    [[ -r "$shadow" ]] || return 2
+    hash=$(awk -F: -v u="$user" '$1 == u { print $2; exit }' "$shadow")
+    case "$hash" in
+        ''|'!'*|'*'*) ;;            # no password, locked (!) or no password login (*)
+        *) return 0 ;;
+    esac
+    # cloud images often have a passwordless user with "NOPASSWD: ALL"
+    if [[ -z "$ROOT_PREFIX" ]] && sudo -n -l -U "$user" 2>/dev/null | grep -qE 'NOPASSWD: *ALL'; then
+        return 0
+    fi
+    return 1
+}
+
 find_sshd() {
     command -v sshd 2>/dev/null && return 0
     [[ -x /usr/sbin/sshd ]] && echo /usr/sbin/sshd
@@ -249,6 +268,20 @@ detect_ssh_ports() {
         found+=$'\n'$(ss -H -ltnp 2>/dev/null | awk '/"sshd"/ { n = split($4, a, ":"); print a[n] }')
     fi
     awk '/^[0-9]+$/ && !seen[$0]++' <<<"$found"
+}
+
+# Local ports of the SSH sessions that are open right now, one per line. sudo removes SSH_CONNECTION
+# from the environment (env_reset), so the sockets of the running sshd processes are read with ss too.
+session_ports() {
+    {
+        awk '{ print $4 }' <<<"${SSH_CONNECTION:-}"
+        if [[ -z "$ROOT_PREFIX" ]] && command -v ss >/dev/null 2>&1; then
+            # the first "address:port" field is the local end; "sshd" also matches sshd-session (OpenSSH 9.8+)
+            ss -Htnp state established 2>/dev/null | awk '/"sshd/ {
+                for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) { n = split($i, a, ":"); print a[n]; break }
+            }'
+        fi
+    } | awk 'NF && !seen[$0]++'
 }
 
 # ------------------------------------------------------ content generators
@@ -348,8 +381,8 @@ step_user() {
     if [[ -n "$CREATE_USER_KEY" ]]; then install_key "$CREATE_USER" "$CREATE_USER_KEY" || return 1; fi
     USER_STEP_OK=1
     if [[ -n "$NEEDS_PASSWORD_USER" ]]; then
-        warn "$CREATE_USER is created WITHOUT a password, so sudo will not work for it yet."
-        warn "Set one before you close your root session: passwd $CREATE_USER"
+        warn "$CREATE_USER is created WITHOUT a password, so sudo will not work for it yet, and the ssh step"
+        warn "will not close root login. Set one (passwd $CREATE_USER), then run: --apply --steps ssh --ssh-user $CREATE_USER"
     else
         info "Reminder: sudo asks for this account's password (set one with: sudo passwd $CREATE_USER)"
     fi
@@ -437,6 +470,18 @@ step_ssh() {
             err "Fix: sudo usermod -aG sudo $user"
             return 1
         fi
+        local state=0
+        sudo_password_state "$user" || state=$?
+        if (( state == 1 )) && will_be_created "$user" && (( DRY_RUN )); then
+            warn "'$user' will be created without a password. Set one (sudo passwd $user) and then run the ssh step,"
+            warn "otherwise --apply stops here: sudo would not work once root login is closed."
+        elif (( state == 1 )); then
+            err "'$user' has no usable password and no NOPASSWD sudo rule, so sudo won't work once root login is closed."
+            err "Fix: sudo passwd $user  (then run again: sudo ./harden.sh --apply --steps ssh --ssh-user $user)"
+            return 1
+        elif (( state == 2 )); then
+            warn "Could not check whether '$user' can use sudo (/etc/shadow is not readable). With --apply this is checked as root."
+        fi
         (( KEEP_PASSWORD_AUTH )) || warn_key_file_perms "$user"
     fi
 
@@ -475,13 +520,15 @@ step_firewall() {
     for port in $ports; do
         run ufw limit "${port}/tcp" || return 1
     done
-    # If the current SSH session is on a different port, open that one too (so we don't cut ourselves off).
-    # sudo drops SSH_CONNECTION unless told to keep it, which is why the listening ports are detected above as well.
-    conn_port=$(awk '{print $4}' <<<"${SSH_CONNECTION:-}")
-    if [[ -n "$conn_port" ]] && valid_port "$conn_port" && ! grep -qx -- "$conn_port" <<<"$ports"; then
-        warn "The current SSH session is on port $conn_port, allowing that one too"
-        run ufw limit "${conn_port}/tcp" || return 1
-    fi
+    # The port of an SSH session that is open right now is allowed too (so we don't cut ourselves off),
+    # also when --ssh-port names another one
+    while IFS= read -r conn_port; do
+        if valid_port "$conn_port" && ! grep -qx -- "$conn_port" <<<"$ports"; then
+            warn "An open SSH session uses port $conn_port, allowing that one too"
+            run ufw limit "${conn_port}/tcp" || return 1
+            ports+=$'\n'"$conn_port"
+        fi
+    done < <(session_ports)
     for spec in ${ALLOW_PORTS[@]+"${ALLOW_PORTS[@]}"}; do
         run ufw allow "$spec" || return 1
     done
@@ -641,7 +688,8 @@ summary() {
     echo "Failed   : ${FAILED_STEPS[*]:-(none)}"
     if [[ -n "$NEEDS_PASSWORD_USER" ]]; then
         echo "WARNING  : '$NEEDS_PASSWORD_USER' has no password, so it cannot use sudo yet."
-        echo "           Run 'passwd $NEEDS_PASSWORD_USER' as root BEFORE you close this session."
+        echo "           Run 'passwd $NEEDS_PASSWORD_USER' as root BEFORE you close this session,"
+        echo "           then '--apply --steps ssh --ssh-user $NEEDS_PASSWORD_USER' closes root login."
     fi
     if (( DRY_RUN )); then
         echo "Mode     : DRY-RUN (nothing was changed). Add --apply to apply."

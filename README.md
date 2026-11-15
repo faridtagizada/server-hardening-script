@@ -22,7 +22,8 @@ What remains is left alone on purpose: the two FAILs (an extra account with UID 
 - Dry run is the default.
 - Password login is only turned off if the user you name with `--ssh-user` already has a key in a file `sshd` reads keys from: `~/.ssh/authorized_keys` or `authorized_keys2` by default, or the paths set with `AuthorizedKeysFile` (read from `sshd -T`).
 - Root login is only closed if there is a user with sudo rights. `--create-user` only counts for that when the `user` step runs in the same invocation and succeeds.
-- An account created with `--create-user` has no password, so `sudo` does not work for it until you run `passwd NAME`. The script warns about this in the `user` step and again in the summary.
+- Root login is only closed if that user can really use `sudo`: the account needs a password (or a `NOPASSWD` rule). An account created with `--create-user` has no password yet, so in that run the `ssh` step stops and root login stays open. Set a password with `passwd NAME`, then run `sudo ./harden.sh --apply --steps ssh --ssh-user NAME`. The script says this in the `user` step and again in the summary.
+- The port of every SSH session that is open right now is allowed in `ufw` as well, also when `--ssh-port` names another one.
 - After writing the SSH config the script runs `sshd -t` and `sshd -T` and looks at the effective values. If `sshd -t` fails, if another file overrides the setting, or if the reload fails, the change is rolled back.
 - In `ufw` the SSH rules are added first, before the default-deny policy and before the firewall is enabled. Every port `sshd` listens on is allowed (read from `sshd -T` and from the listening sockets), and so is the port of your current session when `SSH_CONNECTION` is available. Plain `sudo` removes that variable, which is why the listening ports are checked as well.
 - Every file it changes is copied to `/var/backups/harden-<date>/` first, and a step fails if that copy or the write itself fails. The `perms` step only changes modes and owners; before it does, the old values go into `restore-permissions.sh` in the same backup folder (and into `/var/log/harden.log`).
@@ -213,7 +214,7 @@ If you do get locked out of SSH, log in from the VM console and run the commands
 ## Tests
 
 ```bash
-bash tests/run_tests.sh      # 107 tests (106 as root)
+bash tests/run_tests.sh      # 108-110 tests, a few depend on the user running them (root, sudo)
 shellcheck harden.sh tests/run_tests.sh
 ```
 
@@ -252,7 +253,7 @@ sudo ./harden.sh --apply --ssh-user $USER          # 6. run it again, nothing sh
 server-hardening-script/
 ├── harden.sh                 # the script
 └── tests/
-    ├── run_tests.sh          # 107 tests
+    ├── run_tests.sh          # ~110 tests
     └── fakebin/              # fake sshd and systemctl
 ```
 
